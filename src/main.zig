@@ -1,5 +1,5 @@
 const std = @import("std");
-const bencode = @import("torrentula").bencode;
+const torrentula = @import("torrentula");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -19,7 +19,7 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    var torrent_data = try bencode.parseFile(allocator, args[1]);
+    var torrent_data = try torrentula.readTorrentFile(allocator, args[1]);
     defer torrent_data.deinit(allocator);
     torrent_data.debugPrint();
 }

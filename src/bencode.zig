@@ -1,15 +1,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// Represents the data stored in a torrent file
-pub const TorrentData = union(enum) {
+/// Represents the data stored in a bencode file
+pub const BencodeData = union(enum) {
     int: i64, // Integers (i42e)
     str: []const u8, // Strings (4:spam)
-    list: []TorrentData, // Lists (l...e)
-    dict: std.StringHashMap(TorrentData), // Dictionaries (d...e)
+    list: []BencodeData, // Lists (l...e)
+    dict: std.StringHashMap(BencodeData), // Dictionaries (d...e)
 
-    /// Frees all the memory associated with this TorrentData
-    pub fn deinit(self: *TorrentData, allocator: Allocator) void {
+    /// Frees all the memory associated with this BencodeData
+    pub fn deinit(self: *BencodeData, allocator: Allocator) void {
         switch (self.*) {
             .int => {}, // Nothing to free
             .str => |s| allocator.free(s),
@@ -21,30 +21,38 @@ pub const TorrentData = union(enum) {
         }
     }
 
-    /// Prints a human-readable representation of the data
-    pub fn debugPrint(self: TorrentData) void {
+    /// Convert the BencodeData representation to a bencode string
+    pub fn encode(self: BencodeData, allocator: Allocator, output: *std.ArrayList(u8)) !void {
         switch (self) {
-            .int => |i| std.debug.print("{d}", .{i}),
-            .str => |s| std.debug.print("\"{s}\"", .{s}),
+            .int => |i| try output.writer().print("i{d}e", .{i}),
+            .str => |s| {
+                try output.writer().print("{d}:", .{s.len});
+                try output.appendSlice(s);
+            },
             .list => |items| {
-                std.debug.print("[", .{});
-                for (items, 0..) |item, i| {
-                    item.debugPrint();
-                    if (i < items.len - 1) std.debug.print(", ", .{});
-                }
-                std.debug.print("]", .{});
+                try output.append('l');
+                for (items) |item| try item.encode(allocator, output);
+                try output.append('e');
             },
             .dict => |dict| {
-                std.debug.print("{{ ", .{});
+                try output.append('d');
+
+                // We need to sort the keys for consistent hashing
+                var keys = std.ArrayList([]const u8).init(allocator);
+                defer keys.deinit();
+
                 var iter = dict.iterator();
-                var first = true;
-                while (iter.next()) |entry| {
-                    if (!first) std.debug.print(", ", .{});
-                    first = false;
-                    std.debug.print("\"{s}\": ", .{entry.key_ptr.*});
-                    entry.value_ptr.*.debugPrint();
+                while (iter.next()) |entry| try keys.append(entry.key_ptr.*);
+                std.mem.sort([]const u8, keys.items, {}, keyLessThan);
+
+                // Encode each key-value pair
+                for (keys.items) |key| {
+                    try output.writer().print("{d}:", .{key.len});
+                    try output.appendSlice(key);
+                    try dict.get(key).?.encode(allocator, output);
                 }
-                std.debug.print(" }}", .{});
+
+                try output.append('e');
             },
         }
     }
@@ -59,14 +67,16 @@ pub const ParsingError = error{
     OutOfMemory,
 };
 
-/// Parse a bencode string into a TorrentData structure
-pub fn parse(allocator: Allocator, source: []const u8) !TorrentData {
+/// Parse a bencode string into a BencodeData structure
+pub fn parse(allocator: Allocator, source: []const u8) !BencodeData {
     var position: usize = 0;
-    return try parseExpression(allocator, source, &position);
+    const data = try parseExpression(allocator, source, &position);
+    if (position != source.len) return ParsingError.MalformedInput;
+    return data;
 }
 
 /// Reads and parses a bencode file
-pub fn parseFile(allocator: Allocator, file_path: []const u8) !TorrentData {
+pub fn parseFile(allocator: Allocator, file_path: []const u8) !BencodeData {
     const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
@@ -89,7 +99,7 @@ pub fn parseFile(allocator: Allocator, file_path: []const u8) !TorrentData {
 }
 
 /// Parse a bencode expression at the given given position
-fn parseExpression(allocator: Allocator, source: []const u8, position: *usize) !TorrentData {
+fn parseExpression(allocator: Allocator, source: []const u8, position: *usize) !BencodeData {
     if (position.* >= source.len) {
         return ParsingError.UnexpectedEnd;
     }
@@ -119,7 +129,7 @@ fn parseExpression(allocator: Allocator, source: []const u8, position: *usize) !
             const number = try std.fmt.parseInt(i64, string, 10);
 
             position.* += 1; // Skip 'e'
-            return TorrentData{ .int = if (negative) -number else number };
+            return BencodeData{ .int = if (negative) -number else number };
         },
         '0'...'9' => {
             // Parse the length
@@ -142,12 +152,12 @@ fn parseExpression(allocator: Allocator, source: []const u8, position: *usize) !
             const string = try allocator.dupe(u8, source[position.*..(position.* + length)]);
             position.* += length;
 
-            return TorrentData{ .str = string };
+            return BencodeData{ .str = string };
         },
         'l' => {
             position.* += 1; // Skip 'l'
 
-            var items = std.ArrayList(TorrentData).init(allocator);
+            var items = std.ArrayList(BencodeData).init(allocator);
             errdefer items.deinit();
 
             // Parse list items until we reach the end marker 'e'
@@ -164,12 +174,12 @@ fn parseExpression(allocator: Allocator, source: []const u8, position: *usize) !
 
             // Convert the ArrayList to a slice
             const list_items = try items.toOwnedSlice();
-            return TorrentData{ .list = list_items };
+            return BencodeData{ .list = list_items };
         },
         'd' => {
             position.* += 1; // Skip 'd'
 
-            var dict = std.StringHashMap(TorrentData).init(allocator);
+            var dict = std.StringHashMap(BencodeData).init(allocator);
             errdefer deinitDict(allocator, &dict);
 
             // Parse dictionary entries until we reach the end marker 'e'
@@ -195,19 +205,24 @@ fn parseExpression(allocator: Allocator, source: []const u8, position: *usize) !
             }
 
             position.* += 1; // Skip 'e'
-            return TorrentData{ .dict = dict };
+            return BencodeData{ .dict = dict };
         },
         else => return ParsingError.MalformedInput,
     }
 }
 
-/// Simple utility function to check if a given character is a digit
+/// Needed for sorting the keys in a bencode dict
+fn keyLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Check if a given character is a digit
 fn isDigit(char: u8) bool {
     return (char >= '0' and char <= '9');
 }
 
-/// Simple utility function to free a dictionary from memory
-fn deinitDict(allocator: Allocator, dict: *std.StringHashMap(TorrentData)) void {
+/// Free a dictionary from memory
+fn deinitDict(allocator: Allocator, dict: *std.StringHashMap(BencodeData)) void {
     var iter = dict.iterator();
     while (iter.next()) |entry| {
         allocator.free(entry.key_ptr.*);
